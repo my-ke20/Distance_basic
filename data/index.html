@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultrasonic distance</title>
+<style>
+  :root {
+    --paper: #e9eef1;
+    --ink: #13242e;
+    --muted: #5c717d;
+    --line: #c3d0d7;
+    --sonar: #0f6e8c;
+    --warn: #d9480f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 20px 40px;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+
+  .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.95rem; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  .status.live .dot { background: var(--sonar); }
+  .status.stale .dot { background: var(--warn); }
+
+  .reading {
+    margin: 28px 0 0;
+    font-size: clamp(4rem, 22vw, 8rem);
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums;
+  }
+  .reading small {
+    margin-left: 0.15em;
+    font-size: 0.3em;
+    font-weight: 500;
+    letter-spacing: 0;
+    color: var(--muted);
+  }
+  .reading.near { color: var(--warn); }
+  .reading.empty { color: var(--muted); font-size: clamp(2.5rem, 12vw, 4.5rem); }
+
+  .ruler {
+    position: relative;
+    height: 44px;
+    margin-top: 32px;
+    border-bottom: 2px solid var(--ink);
+    background: repeating-linear-gradient(to right, var(--ink) 0 1px, transparent 1px 2.5%) bottom / 100% 10px no-repeat;
+  }
+  .marker {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 4px;
+    height: 44px;
+    margin-left: -2px;
+    background: var(--sonar);
+    transition: left 0.18s linear, opacity 0.18s linear;
+  }
+  .marker.near { background: var(--warn); }
+  .scale { display: flex; justify-content: space-between; margin-top: 6px; color: var(--muted); font-size: 0.85rem; }
+
+  .chart-head { margin: 36px 0 8px; color: var(--muted); font-size: 0.95rem; }
+  canvas { display: block; width: 100%; height: 180px; border-bottom: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<main>
+  <div class="status" id="status"><span class="dot"></span><span id="state">Connecting...</span></div>
+
+  <p class="reading empty" id="reading">--</p>
+
+  <div class="ruler"><div class="marker" id="marker"></div></div>
+  <div class="scale"><span>0</span><span>100</span><span>200</span><span>300</span><span>400 cm</span></div>
+
+  <p class="chart-head">Last 60 seconds</p>
+  <canvas id="chart"></canvas>
+</main>
+
+<script>
+  const MAX_CM = 400;        // HC-SR04 rated range
+  const NEAR_CM = 20;        // below this the readout turns orange
+  const N = 300;             // 60 s at 5 Hz
+  const STALE_MS = 2000;     // no message for this long = no data
+
+  const readingEl = document.getElementById('reading');
+  const markerEl  = document.getElementById('marker');
+  const statusEl  = document.getElementById('status');
+  const stateEl   = document.getElementById('state');
+  const canvas    = document.getElementById('chart');
+
+  const css = getComputedStyle(document.documentElement);
+  const COLOR_LINE  = css.getPropertyValue('--line').trim();
+  const COLOR_SONAR = css.getPropertyValue('--sonar').trim();
+
+  const samples = [];
+  let lastMessage = 0;
+  let ws = null;
+
+  function setState(text, kind) {
+    stateEl.textContent = text;
+    statusEl.className = 'status ' + kind;
+  }
+
+  function showReading(cm) {
+    if (cm === null) {
+      readingEl.className = 'reading empty';
+      readingEl.textContent = 'No echo';
+      markerEl.style.opacity = 0.25;
+      return;
+    }
+    const near = cm < NEAR_CM;
+    readingEl.className = 'reading' + (near ? ' near' : '');
+    readingEl.innerHTML = cm.toFixed(1) + '<small>cm</small>';
+    markerEl.className = 'marker' + (near ? ' near' : '');
+    markerEl.style.opacity = 1;
+    markerEl.style.left = (Math.min(cm, MAX_CM) / MAX_CM * 100) + '%';
+  }
+
+  function drawChart() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+
+    const g = canvas.getContext('2d');
+    g.scale(dpr, dpr);
+
+    g.strokeStyle = COLOR_LINE;
+    g.lineWidth = 1;
+    for (let cm = 100; cm <= MAX_CM; cm += 100) {
+      const y = h - (cm / MAX_CM) * h;
+      g.beginPath();
+      g.moveTo(0, y);
+      g.lineTo(w, y);
+      g.stroke();
+    }
+
+    g.strokeStyle = COLOR_SONAR;
+    g.lineWidth = 2;
+    g.lineJoin = 'round';
+    g.beginPath();
+    let penDown = false;
+    samples.forEach((v, i) => {
+      if (v === null) { penDown = false; return; }       // gap where there was no echo
+      const x = w - ((samples.length - 1 - i) / (N - 1)) * w;   // newest sample at the right edge
+      const y = h - (Math.min(v, MAX_CM) / MAX_CM) * h;
+      if (penDown) g.lineTo(x, y); else g.moveTo(x, y);
+      penDown = true;
+    });
+    g.stroke();
+  }
+
+  function connect() {
+    // location.host = whatever address served this page, so the same file
+    // works on the router network (station mode) and on the ESP32's own access point.
+    ws = new WebSocket('ws://' + location.host + '/ws');
+
+    ws.onopen = () => setState('Live', 'live');
+
+    ws.onmessage = (event) => {
+      lastMessage = Date.now();
+      const cm = JSON.parse(event.data).cm;
+      showReading(cm);
+      samples.push(cm);
+      if (samples.length > N) samples.shift();
+      drawChart();
+      setState('Live', 'live');
+    };
+
+    ws.onclose = () => {
+      setState('Connection lost. Reconnecting...', 'stale');
+      setTimeout(connect, 1500);
+    };
+  }
+
+  // A silent Wi-Fi drop can leave the socket looking open, so also watch the clock.
+  setInterval(() => {
+    if (lastMessage && Date.now() - lastMessage > STALE_MS) {
+      setState('No data for ' + Math.round((Date.now() - lastMessage) / 1000) + ' s', 'stale');
+    }
+  }, 1000);
+
+  window.addEventListener('resize', drawChart);
+  connect();
+</script>
+</body>
+</html>
